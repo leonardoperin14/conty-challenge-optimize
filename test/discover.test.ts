@@ -35,6 +35,25 @@ describe("descoberta de criadores", () => {
     expect(getQueryCount()).toBe(4);
   });
 
+  it("normaliza os parâmetros de paginação", async () => {
+    for (const query of ["", "?limit=0", "?limit=20&offset=-1", "?limit=20&offset=Infinity"]) {
+      const res = await app.request(`/campaigns/${CAMPAIGN_ID}/creators${query}`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(fixture);
+    }
+
+    const db = openDatabase(":memory:");
+    seed(db, { creators: 600, seed: 7 });
+    const largeApp = createApp(db);
+    const cappedRes = await largeApp.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=100`);
+    const explicitRes = await largeApp.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=50`);
+    expect(cappedRes.status).toBe(200);
+    expect(explicitRes.status).toBe(200);
+    const capped = (await cappedRes.json()) as { creators: unknown[] };
+    expect(capped).toEqual(await explicitRes.json());
+    expect(capped.creators).toHaveLength(50);
+  });
+
   it("responde 404 quando a campanha não existe", async () => {
     resetQueryCount();
     const res = await app.request("/campaigns/cmp_missing/creators");
