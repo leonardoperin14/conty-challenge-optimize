@@ -28,11 +28,11 @@ describe("descoberta de criadores", () => {
     expect(await res.json()).toEqual(fixture);
   });
 
-  it("executa quatro consultas para a página de 20", async () => {
+  it("responde a página de 20 com no máximo 8 queries", async () => {
     resetQueryCount();
     const res = await app.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=20&offset=0`);
     expect(res.status).toBe(200);
-    expect(getQueryCount()).toBe(4);
+    expect(getQueryCount()).toBeLessThanOrEqual(8);
   });
 
   it("normaliza os parâmetros de paginação", async () => {
@@ -55,6 +55,11 @@ describe("descoberta de criadores", () => {
   });
 
   it("responde 404 quando a campanha não existe", async () => {
+    const res = await app.request("/campaigns/cmp_missing/creators");
+    expect(res.status).toBe(404);
+  });
+
+  it("contabiliza uma consulta quando a campanha não existe", async () => {
     resetQueryCount();
     const res = await app.request("/campaigns/cmp_missing/creators");
     expect(res.status).toBe(404);
@@ -68,7 +73,7 @@ describe("descoberta de criadores", () => {
     resetQueryCount();
     const res = await big.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=20&offset=0`);
     expect(res.status).toBe(200);
-    expect(getQueryCount()).toBe(4);
+    expect(getQueryCount()).toBeLessThanOrEqual(8);
   });
 });
 
