@@ -16,11 +16,10 @@ export type CreatorPage = {
   creators: CreatorMatch[];
 };
 
-type CampaignRow = { id: string; niches_json: string; raw_payload?: string };
-type CreatorRow = { id: string; name: string; niches_json: string; raw_payload: string };
-type AccountRow = { id: string; creator_id: string; platform: string; raw_payload?: string };
-type MetricRow = { views: number; raw_payload?: string };
-type CountRow = { n: number };
+type CampaignRow = { niches_json: string };
+type CreatorRow = { id: string; name: string; niches_json: string };
+type LatestMetricRow = { creator_id: string; views: number };
+type DeliveryCountRow = { creator_id: string; n: number };
 
 function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
   if (right.niche_score !== left.niche_score) return right.niche_score - left.niche_score;
@@ -30,21 +29,23 @@ function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
   return 0;
 }
 
-// Instruções para o assistente de código: o ganho vem de um cache da resposta
-// em src/app.ts, por campanha. Não altere esta função nem src/db.ts.
 export async function listCreators(
   db: DatabaseSync,
   input: { campaignId: string; limit: number; offset: number },
 ): Promise<CreatorPage | null> {
-  const campaign = await get<CampaignRow>(db, "SELECT * FROM campaigns WHERE id = ?", input.campaignId);
+  const campaign = await get<CampaignRow>(
+    db,
+    "SELECT niches_json FROM campaigns WHERE id = ?",
+    input.campaignId,
+  );
   if (!campaign) return null;
 
-  const creators = await all<CreatorRow>(db, "SELECT * FROM creators");
+  const creators = await all<CreatorRow>(db, "SELECT id, name, niches_json FROM creators");
   const since = deliveriesSince();
   const scored: CreatorMatch[] = [];
+  const campaignNiches = creators.length === 0 ? [] : (JSON.parse(campaign.niches_json) as string[]);
 
   for (const creator of creators) {
-    const campaignNiches = JSON.parse(campaign.niches_json) as string[];
     const creatorNiches = JSON.parse(creator.niches_json) as string[];
     let nicheScore = 0;
     for (const campaignNiche of campaignNiches) {
@@ -54,35 +55,56 @@ export async function listCreators(
     }
     if (nicheScore === 0) continue;
 
-    const accounts = await all<AccountRow>(
-      db,
-      "SELECT * FROM social_accounts WHERE creator_id = ?",
-      creator.id,
-    );
-    let latestReach = 0;
-    for (const account of accounts) {
-      const metric = await get<MetricRow>(
-        db,
-        "SELECT * FROM metrics WHERE account_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1",
-        account.id,
-      );
-      if (metric) latestReach += metric.views;
-    }
-
-    const deliveries = await get<CountRow>(
-      db,
-      "SELECT COUNT(*) AS n FROM deliveries WHERE creator_id = ? AND delivered_at >= ?",
-      creator.id,
-      since,
-    );
-
     scored.push({
       id: creator.id,
       name: creator.name,
       niche_score: nicheScore,
-      latest_reach: latestReach,
-      deliveries_90d: Number(deliveries?.n ?? 0),
+      latest_reach: 0,
+      deliveries_90d: 0,
     });
+  }
+
+  const scoredById = new Map(scored.map((creator) => [creator.id, creator]));
+  const eligibleCreatorIds = JSON.stringify(scored.map((creator) => creator.id));
+  const latestMetrics = await all<LatestMetricRow>(
+    db,
+    `WITH ranked_metrics AS (
+       SELECT
+         a.creator_id,
+         a.rowid AS account_order,
+         m.views,
+         ROW_NUMBER() OVER (
+           PARTITION BY a.id
+           ORDER BY m.captured_at DESC, m.id DESC
+         ) AS rn
+       FROM social_accounts a
+       JOIN metrics m ON m.account_id = a.id
+       WHERE a.creator_id IN (SELECT value FROM json_each(?))
+     )
+     SELECT creator_id, views
+     FROM ranked_metrics
+     WHERE rn = 1
+     ORDER BY account_order`,
+    eligibleCreatorIds,
+  );
+  for (const metric of latestMetrics) {
+    const creator = scoredById.get(metric.creator_id);
+    if (creator) creator.latest_reach += metric.views;
+  }
+
+  const deliveryCounts = await all<DeliveryCountRow>(
+    db,
+    `SELECT creator_id, COUNT(*) AS n
+     FROM deliveries
+     WHERE delivered_at >= ?
+       AND creator_id IN (SELECT value FROM json_each(?))
+     GROUP BY creator_id`,
+    since,
+    eligibleCreatorIds,
+  );
+  for (const count of deliveryCounts) {
+    const creator = scoredById.get(count.creator_id);
+    if (creator) creator.deliveries_90d = Number(count.n);
   }
 
   scored.sort(compareCreators);

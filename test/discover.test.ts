@@ -28,16 +28,18 @@ describe("descoberta de criadores", () => {
     expect(await res.json()).toEqual(fixture);
   });
 
-  it("responde a página de 20 com no máximo 8 queries", async () => {
+  it("executa quatro consultas para a página de 20", async () => {
     resetQueryCount();
     const res = await app.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=20&offset=0`);
     expect(res.status).toBe(200);
-    expect(getQueryCount()).toBeLessThanOrEqual(8);
+    expect(getQueryCount()).toBe(4);
   });
 
   it("responde 404 quando a campanha não existe", async () => {
+    resetQueryCount();
     const res = await app.request("/campaigns/cmp_missing/creators");
     expect(res.status).toBe(404);
+    expect(getQueryCount()).toBe(1);
   });
 
   it("mantém o teto de queries com 600 criadores", async () => {
@@ -47,7 +49,7 @@ describe("descoberta de criadores", () => {
     resetQueryCount();
     const res = await big.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=20&offset=0`);
     expect(res.status).toBe(200);
-    expect(getQueryCount()).toBeLessThanOrEqual(8);
+    expect(getQueryCount()).toBe(4);
   });
 });
 
@@ -110,5 +112,99 @@ describe("casos de borda da listagem", () => {
     const result = await page(edgeApp(), "?limit=20&offset=50");
     expect(result.creators).toEqual([]);
     expect(result.total).toBe(4);
+  });
+});
+
+describe("agrega dados sem alterar a classificação", () => {
+  async function getPage(app: ReturnType<typeof createApp>, campaignId: string): Promise<Page> {
+    const res = await app.request(`/campaigns/${campaignId}/creators`);
+    expect(res.status).toBe(200);
+    return (await res.json()) as Page;
+  }
+
+  it("conta cada par de nichos iguais, inclusive os repetidos", async () => {
+    const db = openDatabase(":memory:");
+    db.exec(`
+      INSERT INTO campaigns VALUES ('cmp_repeat', 'Repetidos', '["tech","tech"]');
+      INSERT INTO creators VALUES ('crt_repeat', 'Repetidos', '["tech","tech"]', '');
+    `);
+
+    const result = await getPage(createApp(db), "cmp_repeat");
+    expect(result.creators[0]?.niche_score).toBe(4);
+  });
+
+  it("soma o alcance de duas contas sem limitar o resultado a inteiro seguro", async () => {
+    const db = openDatabase(":memory:");
+    db.exec(`
+      INSERT INTO campaigns VALUES ('cmp_large', 'Alcance', '["tech"]');
+      INSERT INTO creators VALUES ('crt_large', 'Alcance', '["tech"]', '');
+      INSERT INTO social_accounts VALUES
+        ('acc_large_1', 'crt_large', 'instagram'),
+        ('acc_large_2', 'crt_large', 'tiktok');
+      INSERT INTO metrics VALUES
+        ('met_large_1', 'acc_large_1', 9000000000000000, '2026-05-30T00:00:00.000Z', ''),
+        ('met_large_2', 'acc_large_2', 9000000000000000, '2026-05-30T00:00:00.000Z', '');
+    `);
+
+    const result = await getPage(createApp(db), "cmp_large");
+    expect(result.creators[0]?.latest_reach).toBe(18000000000000000);
+  });
+
+  it("soma métricas pela ordem de inserção das contas e usa só a última de cada conta", async () => {
+    const db = openDatabase(":memory:");
+    db.exec(`
+      INSERT INTO campaigns VALUES ('cmp_order', 'Ordem', '["tech"]');
+      INSERT INTO creators VALUES ('crt_order', 'Ordem', '["tech"]', '');
+      INSERT INTO social_accounts VALUES
+        ('acc_z', 'crt_order', 'instagram'),
+        ('acc_a', 'crt_order', 'tiktok'),
+        ('acc_m', 'crt_order', 'youtube');
+      INSERT INTO metrics VALUES
+        ('met_z_old', 'acc_z', 100, '2026-05-01T00:00:00.000Z', ''),
+        ('met_z_new', 'acc_z', 9007199254740991, '2026-05-30T00:00:00.000Z', ''),
+        ('met_a_old', 'acc_a', 200, '2026-05-01T00:00:00.000Z', ''),
+        ('met_a_new', 'acc_a', 2, '2026-05-30T00:00:00.000Z', ''),
+        ('met_m_old', 'acc_m', 300, '2026-05-01T00:00:00.000Z', ''),
+        ('met_m_new', 'acc_m', 1, '2026-05-30T00:00:00.000Z', '');
+    `);
+
+    const result = await getPage(createApp(db), "cmp_order");
+    expect(result.creators[0]?.latest_reach).toBe(9007199254740992);
+  });
+
+  it("não lê métricas de criadores fora dos nichos da campanha", async () => {
+    const db = openDatabase(":memory:");
+    db.exec(`
+      INSERT INTO campaigns VALUES ('cmp_eligible', 'Elegível', '["tech"]');
+      INSERT INTO creators VALUES
+        ('crt_eligible', 'Elegível', '["tech"]', ''),
+        ('crt_ineligible', 'Inelegível', '["games"]', '');
+      INSERT INTO social_accounts VALUES
+        ('acc_eligible', 'crt_eligible', 'instagram'),
+        ('acc_ineligible', 'crt_ineligible', 'instagram');
+      INSERT INTO metrics VALUES
+        ('met_eligible', 'acc_eligible', 7, '2026-05-30T00:00:00.000Z', ''),
+        ('met_ineligible', 'acc_ineligible', 9007199254740993, '2026-05-30T00:00:00.000Z', '');
+    `);
+
+    const result = await getPage(createApp(db), "cmp_eligible");
+    expect(result.creators.map((creator) => creator.id)).toEqual(["crt_eligible"]);
+    expect(result.creators[0]?.latest_reach).toBe(7);
+  });
+
+  it("faz quatro consultas inclusive quando não há criadores compatíveis", async () => {
+    const db = openDatabase(":memory:");
+    db.exec(`
+      INSERT INTO campaigns VALUES ('cmp_empty', 'Sem matches', '["tech"]');
+      INSERT INTO creators VALUES ('crt_unmatched', 'Sem match', '["games"]', '');
+    `);
+    const app = createApp(db);
+
+    for (let call = 0; call < 2; call += 1) {
+      resetQueryCount();
+      const result = await getPage(app, "cmp_empty");
+      expect(result).toEqual({ campaign_id: "cmp_empty", total: 0, creators: [] });
+      expect(getQueryCount()).toBe(4);
+    }
   });
 });
