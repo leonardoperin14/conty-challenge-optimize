@@ -18,7 +18,7 @@ export type CreatorPage = {
 
 type CampaignRow = { niches_json: string };
 type CreatorRow = { id: string; name: string; niches_json: string };
-type LatestMetricRow = { creator_id: string; views: number };
+type LatestMetricRow = { creator_id: string; views: number | null };
 type DeliveryCountRow = { creator_id: string; n: number };
 
 function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
@@ -68,30 +68,28 @@ export async function listCreators(
   const eligibleCreatorIds = JSON.stringify(scored.map((creator) => creator.id));
   const latestMetrics = await all<LatestMetricRow>(
     db,
-    `WITH ranked_metrics AS (
-       SELECT
-         a.creator_id,
-         a.rowid AS account_order,
-         m.views,
-         ROW_NUMBER() OVER (
-           PARTITION BY a.id
-           ORDER BY m.captured_at DESC, m.id DESC
-         ) AS rn
-       FROM social_accounts a
-       JOIN metrics m ON m.account_id = a.id
-       WHERE a.creator_id IN (SELECT value FROM json_each(?))
-     )
-     SELECT creator_id, views
-     FROM ranked_metrics
-     WHERE rn = 1
-     ORDER BY account_order`,
+    `SELECT a.creator_id,
+       (
+         SELECT latest.views
+         FROM metrics AS latest
+         WHERE latest.account_id = a.id
+         ORDER BY latest.captured_at DESC, latest.id DESC
+         LIMIT 1
+       ) AS views
+     FROM social_accounts AS a
+     WHERE a.creator_id IN (SELECT value FROM json_each(?))
+     -- For each creator, this retains the original account insertion order.
+     ORDER BY a.creator_id, a.rowid`,
     eligibleCreatorIds,
   );
   for (const metric of latestMetrics) {
     const creator = scoredById.get(metric.creator_id);
-    if (creator) creator.latest_reach += metric.views;
+    if (creator && metric.views !== null) creator.latest_reach += metric.views;
   }
 
+  scored.sort(compareCreators);
+  const page = scored.slice(input.offset, input.offset + input.limit);
+  const pageCreatorIds = JSON.stringify(page.map((creator) => creator.id));
   const deliveryCounts = await all<DeliveryCountRow>(
     db,
     `SELECT creator_id, COUNT(*) AS n
@@ -100,17 +98,16 @@ export async function listCreators(
        AND creator_id IN (SELECT value FROM json_each(?))
      GROUP BY creator_id`,
     since,
-    eligibleCreatorIds,
+    pageCreatorIds,
   );
   for (const count of deliveryCounts) {
     const creator = scoredById.get(count.creator_id);
     if (creator) creator.deliveries_90d = Number(count.n);
   }
 
-  scored.sort(compareCreators);
   return {
     campaign_id: input.campaignId,
     total: scored.length,
-    creators: scored.slice(input.offset, input.offset + input.limit),
+    creators: page,
   };
 }
